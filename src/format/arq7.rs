@@ -187,6 +187,26 @@ impl Node {
             (None, None)
         };
 
+        // Tree version >= 4 appends added-time, document id and sparse-file
+        // fields (see Arq 7 dataFormat.html). They are parsed only to stay in
+        // step with the byte stream; restore does not use them (sparse-file
+        // holes are NOT reconstructed; fine for ordinary files).
+        if tree_version >= 4 {
+            r.read_i64_be().context("Node added_time_sec")?;
+            r.read_i64_be().context("Node added_time_nsec")?;
+            r.read_u32_be().context("Node document_id")?;
+            r.read_bool().context("Node has_document_id")?;
+            r.read_bool().context("Node is_sparse")?;
+            r.read_u64_be().context("Node sparse_logical_size")?;
+            let hole_count = r.read_u64_be().context("Node hole_count")?;
+            for i in 0..hole_count {
+                r.read_u64_be()
+                    .with_context(|| format!("Node hole_offset[{i}]"))?;
+                r.read_u64_be()
+                    .with_context(|| format!("Node hole_length[{i}]"))?;
+            }
+        }
+
         Ok(Self {
             is_tree,
             tree_blob_loc,
