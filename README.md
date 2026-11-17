@@ -94,6 +94,20 @@ directory subtrees shared across hundreds of snapshots are walked only once.
 On a 680-snapshot corpus (304 Arq5 + 376 Arq7) with ~555K unique files, a warm-cache
 scan completes in under 5 minutes at ~38 snapshots/second.
 
+### Restore one file or folder from one record (Arq7)
+
+`list` prints each record's date. `restore-path` reads only the trees along the path.
+
+```bash
+arqfastrestore restore-path \
+  --backup-path /path/to/plan-uuid --password-file /path/to/pw \
+  --record before:2026-11-01T12:50:00Z \
+  --path src/project/file.json --dest /tmp/out --cache-path /tmp/trees.redb --dry-run
+```
+
+`--record` is a Unix timestamp, `latest`, `before:<rfc3339>` (newest record strictly before) or `near:<rfc3339>`.
+The relative path is recreated under `--dest`. Drop `--dry-run` to write.
+
 ### Restore a backup
 
 ```bash

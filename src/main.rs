@@ -155,6 +155,48 @@ enum Commands {
         #[arg(long, default_value = "1")]
         pack_concurrency: usize,
     },
+    /// Restore one file or folder from one backup record (Arq7 only)
+    RestorePath {
+        /// Path to the Arq plan folder (the UUID directory)
+        #[arg(short, long)]
+        backup_path: String,
+
+        /// Backup encryption password. Prefer --password-file.
+        #[arg(short, long, env = "ARQ_PASSWORD")]
+        password: Option<String>,
+
+        /// Path to a file containing the password (one line).
+        #[arg(long)]
+        password_file: Option<String>,
+
+        /// Which backup record: a Unix timestamp as shown by `list`, `latest`,
+        /// `before:<rfc3339>` (newest record strictly before that instant) or
+        /// `near:<rfc3339>` (closest record in either direction).
+        /// Example: --record before:2026-11-01T12:50:00Z
+        #[arg(long)]
+        record: String,
+
+        /// File or folder to restore, relative to the backed-up root
+        /// (e.g. src/project/file.json, no leading slash needed).
+        #[arg(long)]
+        path: String,
+
+        /// Destination directory. The relative path is recreated beneath it.
+        #[arg(short, long)]
+        dest: String,
+
+        /// Resolve the record and path and print what would be restored, writing nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Tree cache database path (keep it off the backup volume)
+        #[arg(long)]
+        cache_path: Option<String>,
+
+        /// Disable the persistent tree cache
+        #[arg(long)]
+        no_cache: bool,
+    },
     /// Restore specific files from a scan CSV (rows with action=restore)
     RestoreFromCsv {
         /// Path to the scan CSV file produced by the `scan` command
@@ -281,8 +323,11 @@ fn main() -> Result<()> {
                     for r in records {
                         let complete = if r.is_complete { "" } else { " [incomplete]" };
                         println!(
-                            "  timestamp={}  arq={}{}",
-                            r.timestamp, r.arq_version, complete
+                            "  timestamp={}  date={}  arq={}{}",
+                            r.timestamp,
+                            format_rfc3339(r.timestamp),
+                            r.arq_version,
+                            complete
                         );
                     }
                 }
@@ -476,6 +521,26 @@ fn main() -> Result<()> {
             }
 
             Ok(())
+        }
+        Commands::RestorePath {
+            backup_path,
+            password,
+            password_file,
+            record,
+            path,
+            dest,
+            dry_run,
+            cache_path,
+            no_cache,
+        } => {
+            let password = resolve_password(password, password_file)?;
+            let bp = PathBuf::from(&backup_path);
+            let keys = match detect_format(&bp, &password)? {
+                BackupFormat::Arq7(k) => Some(k),
+                BackupFormat::Unencrypted => None,
+                BackupFormat::Arq5(_) => bail!("restore-path supports Arq7 backups only"),
+            };
+            restore_path_arq7(&backup_path, keys, &record, &path, &dest, dry_run, cache_path, no_cache)
         }
         Commands::RestoreFromCsv {
             csv,
@@ -1772,6 +1837,178 @@ fn build_scan_context(
     }
 }
 
+/// How `restore-path --record` picks a backup record.
+#[derive(Debug, PartialEq, Eq)]
+enum RecordSelector {
+    Latest,
+    Timestamp(u64),
+    /// Newest record with timestamp strictly before the instant.
+    Before(u64),
+    /// Record closest to the instant (ties go to the earlier one).
+    Near(u64),
+}
+
+fn parse_record_selector(s: &str) -> Result<RecordSelector> {
+    if s == "latest" {
+        return Ok(RecordSelector::Latest);
+    }
+    if let Some(t) = s.strip_prefix("before:") {
+        return Ok(RecordSelector::Before(parse_rfc3339(t)?));
+    }
+    if let Some(t) = s.strip_prefix("near:") {
+        return Ok(RecordSelector::Near(parse_rfc3339(t)?));
+    }
+    s.parse::<u64>()
+        .map(RecordSelector::Timestamp)
+        .map_err(|_| anyhow::anyhow!("--record must be a timestamp, 'latest', 'before:<rfc3339>' or 'near:<rfc3339>', got '{s}'"))
+}
+
+fn select_record_by<'a>(
+    folders: &'a [(String, String, Vec<BackupRecord>)],
+    sel: &RecordSelector,
+) -> Option<&'a BackupRecord> {
+    let all = folders
+        .iter()
+        .flat_map(|(_, _, rs)| rs.iter())
+        .filter(|r| r.root_tree_blob_loc.is_some());
+    match *sel {
+        RecordSelector::Latest => all.max_by_key(|r| r.timestamp),
+        RecordSelector::Timestamp(t) => all.into_iter().find(|r| r.timestamp == t),
+        RecordSelector::Before(t) => all.filter(|r| r.timestamp < t).max_by_key(|r| r.timestamp),
+        // Key puts the earlier record first on a tie (Reverse timestamp as tiebreak).
+        RecordSelector::Near(t) => all.min_by_key(|r| (r.timestamp.abs_diff(t), r.timestamp)),
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Format Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+fn format_rfc3339(ts: u64) -> String {
+    let days = (ts / 86400) as i64;
+    let rem = ts % 86400;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SS[.frac](Z|+HH:MM|-HH:MM)` to Unix seconds.
+fn parse_rfc3339(s: &str) -> Result<u64> {
+    let err = || anyhow::anyhow!("invalid RFC 3339 time '{s}' (want e.g. 2026-11-01T12:50:00Z)");
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !(b[10] == b'T' || b[10] == b't' || b[10] == b' ') || b[13] != b':' || b[16] != b':' {
+        return Err(err());
+    }
+    let num = |a: usize, z: usize| -> Result<i64> { s.get(a..z).and_then(|t| t.parse().ok()).ok_or_else(err) };
+    let (y, mo, d, h, mi, sec) = (num(0, 4)?, num(5, 7)?, num(8, 10)?, num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return Err(err());
+    }
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    let offset = match &s[i..] {
+        "Z" | "z" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) && &o[3..4] == ":" => {
+            let hh: i64 = o[1..3].parse().map_err(|_| err())?;
+            let mm: i64 = o[4..6].parse().map_err(|_| err())?;
+            let v = hh * 3600 + mm * 60;
+            if o.starts_with('-') { -v } else { v }
+        }
+        _ => return Err(err()),
+    };
+    let t = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec - offset;
+    u64::try_from(t).map_err(|_| err())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_path_arq7(
+    backup_path: &str,
+    keys: Option<Arq7Keys>,
+    record_sel: &str,
+    rel_path: &str,
+    dest: &str,
+    dry_run: bool,
+    cache_path: Option<String>,
+    no_cache: bool,
+) -> Result<()> {
+    let sel = parse_record_selector(record_sel)?;
+    let storage = LocalStorage::new(backup_path);
+    let folders = list_backup_folders_all_plans(&storage, keys.as_ref())?;
+    let record = select_record_by(&folders, &sel)
+        .with_context(|| format!("no backup record matches --record {record_sel}"))?;
+    println!(
+        "Record timestamp={} date={} folder={} complete={}",
+        record.timestamp,
+        format_rfc3339(record.timestamp),
+        record.local_path,
+        record.is_complete
+    );
+    let root_loc = record.root_tree_blob_loc.as_ref().context("record has no root tree")?;
+
+    // Same layout rule as restore_arq7: blob relativePaths include the plan UUID dir.
+    let blob_storage_root = PathBuf::from(backup_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(backup_path));
+    let storage_arc: Arc<dyn storage::Storage> = Arc::new(LocalStorage::new(&blob_storage_root));
+    let decrypt: Option<DecryptFn> =
+        keys.map(|k| -> DecryptFn { Arc::new(move |data: &[u8]| decrypt_arq7_object(data, &k)) });
+    use crate::format::arq7::Tree;
+    let parse_tree: TreeParseFn = Arc::new(|data: &[u8]| Tree::parse(data));
+    let cache = open_tree_cache(no_cache, cache_path, false)?;
+
+    let reader = storage::BlobReader::new(storage_arc.clone(), decrypt.clone());
+    let items = restore::collect_path_items(
+        &reader,
+        root_loc,
+        rel_path,
+        Path::new(dest),
+        cache.as_ref(),
+        &indicatif::ProgressBar::hidden(),
+        &parse_tree,
+    )?;
+    for it in &items {
+        println!(
+            "  {} ({} bytes){}",
+            it.dest_path.display(),
+            it.node.item_size,
+            if it.node.is_tree { " [dir]" } else { "" }
+        );
+    }
+
+    let engine = RestoreEngine::new(storage_arc, decrypt, PathBuf::from(dest), dry_run, false, cache, parse_tree, 1);
+    let stats = engine.restore_items(items)?;
+    print_restore_stats(&stats, dry_run);
+    if stats.files_failed > 0 {
+        bail!("{} item(s) failed to restore", stats.files_failed);
+    }
+    Ok(())
+}
+
 /// Select the backup record matching the given timestamp, or the most recent
 /// record if `timestamp` is `None`.
 fn select_record(
@@ -1803,6 +2040,36 @@ mod tests {
             arq_version: "7.0".to_owned(),
             is_complete: true,
         }
+    }
+
+    #[test]
+    fn rfc3339_roundtrip_and_offsets() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(parse_rfc3339("2026-11-01T12:50:00Z").unwrap(), 1793537400);
+        assert_eq!(format_rfc3339(1793537400), "2026-11-01T12:50:00Z");
+        assert_eq!(parse_rfc3339("2026-11-01T13:50:00.5+01:00").unwrap(), 1793537400);
+        assert_eq!(format_rfc3339(951782400), "2000-02-29T00:00:00Z");
+        assert!(parse_rfc3339("2026-13-01T00:00:00Z").is_err());
+        assert!(parse_rfc3339("yesterday").is_err());
+    }
+
+    #[test]
+    fn record_selectors() {
+        let folders = vec![("u".to_owned(), "/x".to_owned(), vec![make_record(100), make_record(200), make_record(300)])];
+        let mut folders = folders;
+        for r in &mut folders[0].2 {
+            r.root_tree_blob_loc = Some(crate::format::arq7::BlobLoc {
+                identifier: "x".into(), is_packed: false, is_large_pack: false, relative_path: None,
+                offset: 0, length: 0, stretch_encryption_key: false, compression_type: 0, is_arq5_pack_entry: false,
+            });
+        }
+        let pick = |s: &str| select_record_by(&folders, &parse_record_selector(s).unwrap()).map(|r| r.timestamp);
+        assert_eq!(pick("latest"), Some(300));
+        assert_eq!(pick("200"), Some(200));
+        assert_eq!(pick("before:1970-01-01T00:04:20Z"), Some(200));
+        assert_eq!(pick("before:1970-01-01T00:01:40Z"), None); // strictly before 100
+        assert_eq!(pick("near:1970-01-01T00:02:30Z"), Some(100)); // tie -> earlier
+        assert!(parse_record_selector("soon").is_err());
     }
 
     #[test]

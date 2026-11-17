@@ -37,6 +37,7 @@ pub type TreeParseFn = Arc<dyn Fn(&[u8]) -> Result<Tree> + Send + Sync>;
 static TREES_PARSED: AtomicUsize = AtomicUsize::new(0);
 
 /// A file or directory to be restored.
+#[derive(Debug)]
 pub struct RestoreItem {
     /// Absolute destination path on the output filesystem.
     pub dest_path: PathBuf,
@@ -118,7 +119,7 @@ pub fn walk_tree(
 }
 
 /// Read and parse a single tree blob, using the cache if available.
-fn read_tree(
+pub(crate) fn read_tree(
     blob_reader: &BlobReader,
     loc: &BlobLoc,
     cache: Option<&TreeCache>,
